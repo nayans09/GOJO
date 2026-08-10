@@ -1,0 +1,75 @@
+# GOJO Run Summary
+
+Metrics are reported separately by scenario and protocol.
+
+## scenario_1__deliberation
+
+- **episodes_recorded:** 200
+- **episodes_completed:** 200
+- **episodes_invalid:** 0
+- **success_rate:** 0.045
+- **mean_turns:** 28.805
+- **mean_efficiency_j:** 1.0
+- **initial_action_accuracy:** 0.5004339524388127
+- **final_action_accuracy:** 0.5004339524388127
+- **revision_rate:** 0.0
+- **beneficial_revision_rate:** 0.0
+- **harmful_revision_rate:** 0.0
+- **selected_direction_brier_score:** 0.28982641902447487
+- **mean_vote_agreement:** 0.9854191980558931
+- **decoy_pursuit_rate:** 0.0
+- **mean_cost_usd_per_episode:** 0.0
+- **mean_retries_per_episode:** 0.0
+- **mean_allocator_self_serving_proxy:** 0.02123054549955135
+- **allocation_events:** 9
+
+- _Beneficial/harmful revision rates are outcome-based descriptive measures, not causal evidence of peer influence._
+- _Allocation proxy is exploratory; it is not a validated contribution or greed metric._
+
+## scenario_2__deliberation
+
+- **episodes_recorded:** 200
+- **episodes_completed:** 200
+- **episodes_invalid:** 0
+- **success_rate:** 0.055
+- **mean_turns:** 28.58
+- **mean_efficiency_j:** 1.0
+- **initial_action_accuracy:** 0.530572078376487
+- **final_action_accuracy:** 0.530572078376487
+- **revision_rate:** 0.0
+- **beneficial_revision_rate:** 0.0
+- **harmful_revision_rate:** 0.0
+- **selected_direction_brier_score:** 0.27777116864940515
+- **mean_vote_agreement:** 0.9499212736179147
+- **decoy_pursuit_rate:** 0.0
+- **mean_cost_usd_per_episode:** 0.0
+- **mean_retries_per_episode:** 0.0
+- **mean_allocator_self_serving_proxy:** 0.009612956551920225
+- **allocation_events:** 11
+
+- _Beneficial/harmful revision rates are outcome-based descriptive measures, not causal evidence of peer influence._
+- _Allocation proxy is exploratory; it is not a validated contribution or greed metric._
+
+## scenario_3__deliberation
+
+- **episodes_recorded:** 200
+- **episodes_completed:** 200
+- **episodes_invalid:** 0
+- **success_rate:** 0.05
+- **mean_turns:** 28.685
+- **mean_efficiency_j:** 1.0
+- **initial_action_accuracy:** 0.5253616872930102
+- **final_action_accuracy:** 0.5253616872930102
+- **revision_rate:** 0.0
+- **beneficial_revision_rate:** 0.0
+- **harmful_revision_rate:** 0.0
+- **selected_direction_brier_score:** 0.27985532508279587
+- **mean_vote_agreement:** 0.9141973156702109
+- **decoy_pursuit_rate:** 0.05664981697751438
+- **mean_cost_usd_per_episode:** 0.0
+- **mean_retries_per_episode:** 0.0
+- **mean_allocator_self_serving_proxy:** -0.013655221590004202
+- **allocation_events:** 10
+
+- _Beneficial/harmful revision rates are outcome-based descriptive measures, not causal evidence of peer influence._
+- _Allocation proxy is exploratory; it is not a validated contribution or greed metric._
