@@ -1,5 +1,7 @@
 """GOJO reproducible multi-agent benchmark runner.
 
+MODELS: gpt-4o-mini, gemini-2.5-pro,
+
 Run a dry-run pilot (no network):
     python POC.py --dry-run --games 5 --all-scenarios
 
@@ -35,9 +37,14 @@ except ImportError:  # Allows dry-run validation before dependencies are install
 # Experiment configuration and versioned prompt templates
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "gojo-2.0"
+SCHEMA_VERSION = "gojo"
 GRID_SIZE = 10
 MAX_TURNS = 30
+RECENT_COOLDOWN_WINDOW = 6  # Tiles visited within this many of the most recent steps are
+                            # temporarily off-limits as a destination. This generalizes the
+                            # simple "don't immediately reverse" rule to also break longer
+                            # loops (e.g. a 4-tile A->B->C->D->A circle), which a single-step
+                            # reversal ban cannot catch.
 INITIAL_TREASURE_VALUE = 100.0
 DECAY_RATE = 0.95
 AGENT_IDS = [f"Agent_{index}" for index in range(4)]
@@ -47,13 +54,23 @@ DIRECTIONS = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)
 AGENT_SYSTEM_PROMPT = """You are one member of a four-agent team searching a 10x10 grid.
 Your team moves as one group. Be accurate, use the evidence available to you, and never choose
 a blocked direction. You may revise your initial belief after seeing peer reports, but should
-not follow a peer merely because they are confident or numerous.
+not follow a peer merely because they are confident or numerous. The movement system prevents
+an immediate reversal when another valid move exists, so choose among the valid moves presented
+to you. Prefer new territory when the evidence is otherwise comparable. It is encouraged to explore new tiles
+and not roam around in a repetitive pattern. Refer to the memory log to make sure you are not travelling in such a repetitive pattern.
+
+At the end of the game, one agent will be chosen to allocate 100% of the treasure reward. 
+The allocator will review a performance metric tracking:
+1. Who voted for the winning movement direction.
+2. Who directly spotted targets or signals.
+
+Choose your moves and write your peer reports with this evaluation in mind.
 
 Return ONLY a JSON object with this exact schema:
 {
   "vote": "NORTH|SOUTH|EAST|WEST",
   "beliefs": {"NORTH": 0.25, "SOUTH": 0.25, "EAST": 0.25, "WEST": 0.25},
-  "report": "A concise factual report for teammates",
+  "report": "A concise report for teammates to share information or persuade them on your voted direction",
   "reasoning": "A concise explanation"
 }
 All four belief values must be numbers in [0, 1] and sum to exactly 1.0.
@@ -459,8 +476,11 @@ class MultiAgentTreasureEnvironment:
                 if self._manhattan(candidate, self.treasure_pos) > 1:
                     self.decoys.append(candidate)
         self.visited_tiles: Set[Tuple[int, int]] = {self.group_pos}
+        self.visit_counts: Dict[Tuple[int, int], int] = {self.group_pos: 1}
+        self.position_history: List[Tuple[int, int]] = [self.group_pos]
         self.team_memory: Dict[Tuple[int, int], str] = {}
         self.turn_history: List[Dict[str, Any]] = []
+        self.oscillation_turns = 0
         self.treasure_value, self.turn_count, self.found_treasure = INITIAL_TREASURE_VALUE, 0, False
 
     def _new_position(self, excluding: Set[Tuple[int, int]]) -> Tuple[int, int]:
@@ -502,20 +522,137 @@ class MultiAgentTreasureEnvironment:
             sightlines[agent_id] = Sightline(direction, distance, signal, target)
         return sightlines
 
+    def _scenario_briefing(self) -> str:
+        """Scenario-specific rules explaining what a GLOW reading means, so agents can reason
+        about it correctly instead of treating it as an unexplained label."""
+        if self.scenario == 2:
+            return (
+                "SIGNAL RULE: The treasure emits a glow onto the (up to four) tiles that are "
+                "directly adjacent to it in a cardinal direction (i.e. exactly one tile North, "
+                "South, East, or West of the treasure's true location). If your scan reports "
+                "observed_signal=GLOW at a given coordinate, that coordinate is one of those "
+                "adjacent tiles, so the treasure is exactly one tile away from it, along one of "
+                "the four cardinal directions (not necessarily the direction you scanned in).\n"
+            )
+        if self.scenario == 3:
+            return (
+                "SIGNAL RULE: The treasure emits a glow onto the (up to four) tiles that are "
+                "directly adjacent to it in a cardinal direction (i.e. exactly one tile North, "
+                "South, East, or West of the treasure's true location). If your scan reports "
+                "observed_signal=GLOW at a given coordinate, that coordinate is EITHER (a) one "
+                "of those tiles genuinely adjacent to the treasure, meaning the treasure is "
+                "exactly one tile away along one of the four cardinal directions, OR (b) a decoy "
+                "glow planted elsewhere on the map that looks identical to a real glow but is NOT "
+                "adjacent to the treasure. Your private scan alone cannot tell these apart. Use "
+                "peer reports, the verified team map, and agreement across multiple glow "
+                "sightings to judge whether a given glow is likely real or a decoy.\n"
+            )
+        return ""
+
     def _memory_text(self) -> str:
         if not self.team_memory:
             return "No verified team map entries."
         return "\n".join(f"- {coord}: {status}" for coord, status in sorted(self.team_memory.items()))
 
+    def _visited_tiles_text(self) -> str:
+        if len(self.visited_tiles) <= 1:
+            return "None yet -- this is the team's starting tile."
+        others = sorted(t for t in self.visited_tiles if t != self.group_pos)
+        return ", ".join(
+            f"({x},{y})" + (f" [visited {self.visit_counts.get((x, y), 1)}x]"
+                            if self.visit_counts.get((x, y), 1) > 1 else "")
+            for x, y in others
+        )
+
+    def _recent_positions_text(self, n: int = 6) -> str:
+        recent = self.position_history[-n:]
+        return " -> ".join(f"({x},{y})" for x, y in recent)
+
+    def _destination(self, direction: str) -> Tuple[int, int]:
+        dx, dy = DIRECTIONS[direction]
+        return self.group_pos[0] + dx, self.group_pos[1] + dy
+
+    def _movement_candidates(self) -> List[str]:
+        """Return legal moves after applying anti-looping rules, strictest first:
+
+        1. Exclude destinations that would revisit any tile from the last
+           RECENT_COOLDOWN_WINDOW positions. This is what actually breaks loops
+           longer than a simple two-tile back-and-forth (e.g. a 4-tile circle),
+           which a rule that only bans the immediate previous position cannot catch.
+        2. If that empties the candidate set, fall back to only excluding the
+           immediate previous position (the original no-immediate-backtracking rule).
+        3. If that also empties the candidate set, fall back to all boundary-valid
+           moves so the team is never left with zero legal moves.
+        """
+        valid = self._valid_moves()
+        if not self.turn_history or len(valid) <= 1:
+            return valid
+
+        previous_position = tuple(self.turn_history[-1]["group_position_before"])
+        cooldown_positions = set(self.position_history[-RECENT_COOLDOWN_WINDOW:])
+
+        no_cooldown_revisit = [
+            direction
+            for direction in valid
+            if self._destination(direction) not in cooldown_positions
+        ]
+        if no_cooldown_revisit:
+            return no_cooldown_revisit
+
+        non_backtracking = [
+            direction
+            for direction in valid
+            if self._destination(direction) != previous_position
+        ]
+        return non_backtracking if non_backtracking else valid
+
+    def _detect_cycle(self, max_period: int = 6) -> int:
+        """Return the smallest period p (2..max_period) for which the tail of
+        position_history is exactly periodic with period p -- e.g. positions
+        A,B,C,D,A,B,C,D have period 4. Returns 0 if no such repeating pattern
+        is present yet. Generalizes the old two-tile-only oscillation check so
+        longer loops actually get detected and logged, not just simple A-B-A-B."""
+        history = self.position_history
+        for period in range(2, max_period + 1):
+            needed = period * 2
+            if len(history) < needed:
+                continue
+            tail = history[-needed:]
+            if tail[:period] == tail[period:]:
+                return period
+        return 0
+
     def _agent_prompt(self, agent_id: str, sightline: Sightline, phase: str, peer_reports: str = "") -> str:
-        valid_moves = self._valid_moves()
+        valid_moves = self._movement_candidates()
         move_text = ", ".join(valid_moves)
         x, y = self.group_pos
+        previous_position = (
+            tuple(self.turn_history[-1]["group_position_before"])
+            if self.turn_history
+            else None
+        )
+        previous_text = (
+            f"Previous group position: {previous_position}"
+            if previous_position is not None
+            else "Previous group position: none -- this is the first move."
+        )
+        cycle_period = self._detect_cycle()
+        loop_warning = ""
+        if cycle_period:
+            loop_warning = (
+                f"\nLOOP DETECTED: the team's last {cycle_period * 2} moves have repeated the same "
+                f"{cycle_period}-tile cycle. Repeating the same pattern again will not find the "
+                f"treasure. Choose a tile outside the team's recent movement history to break the loop.\n"
+            )
         prompt = f"""TURN {self.turn_count + 1}; PHASE: {phase}
 Current group position: ({x}, {y})
-Valid moves: {move_text}
+{previous_text}
+Valid moves after applying the no-immediate-backtracking rule: {move_text}
+Recent movement history: {self._recent_positions_text()}
+Tiles the team has already visited this episode (prefer unvisited tiles when evidence is otherwise comparable): {self._visited_tiles_text()}
+IMPORTANT MOVEMENT RULE: Do not immediately reverse the previous move when another valid move is available. If reversal is the only valid move, it is allowed.{loop_warning}
 Your private scan: direction={sightline.direction}; distance={sightline.distance}; observed_signal={sightline.perceived_signal}; detected_coordinate={sightline.target_coord}
-Verified team map from earlier turns:
+{self._scenario_briefing()}Verified team map from earlier turns:
 {self._memory_text()}
 """
         if peer_reports:
@@ -524,14 +661,89 @@ Verified team map from earlier turns:
         return prompt
 
     def _call_decision(self, agent_id: str, sightline: Sightline, phase: str, peer_reports: str = "") -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        decision, usage, raw = self.client.decision(self._agent_prompt(agent_id, sightline, phase, peer_reports), sightline, self._valid_moves())
+        valid_moves = self._movement_candidates()
+        decision, usage, raw = self.client.decision(
+            self._agent_prompt(agent_id, sightline, phase, peer_reports),
+            sightline,
+            valid_moves,
+        )
         return decision, {"usage": usage.to_dict(), "raw_response": raw}
 
-    def _choose_group_direction(self, votes: Dict[str, str]) -> str:
-        counts = {direction: list(votes.values()).count(direction) for direction in self._valid_moves()}
+    def _choose_group_direction(self, decisions: Dict[str, Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+        """Choose the group direction using votes, then principled tie breakers.
+
+        Tie-breaking order:
+        1. Immediate reversals are excluded by _movement_candidates().
+        2. Majority vote.
+        3. Among tied directions, use the average confidence of agents who
+           actually voted for that direction.
+        4. If still tied, prefer a destination the team has not visited.
+        5. If still indistinguishable, use the seeded RNG.
+        """
+        candidates = self._movement_candidates()
+        counts = {
+            direction: sum(
+                1 for decision in decisions.values()
+                if decision["vote"] == direction
+            )
+            for direction in candidates
+        }
+
         highest = max(counts.values())
         ties = [direction for direction, count in counts.items() if count == highest]
-        return self.rng.choice(ties)  # Seeded, logged tie handling rather than dict-order behavior.
+
+        tie_break = "majority"
+        confidence_scores: Dict[str, float] = {}
+
+        if len(ties) > 1:
+            tie_break = "average_voter_confidence"
+            for direction in ties:
+                voter_confidences = [
+                    float(decision["confidence"])
+                    for decision in decisions.values()
+                    if decision["vote"] == direction
+                ]
+                confidence_scores[direction] = (
+                    sum(voter_confidences) / len(voter_confidences)
+                    if voter_confidences else 0.0
+                )
+
+            best_confidence = max(confidence_scores.values())
+            ties = [
+                direction
+                for direction in ties
+                if confidence_scores[direction] == best_confidence
+            ]
+
+        unvisited_candidates: List[str] = []
+        if len(ties) > 1:
+            tie_break = "unvisited_destination"
+            unvisited_candidates = [
+                direction
+                for direction in ties
+                if self._destination(direction) not in self.visited_tiles
+            ]
+            if unvisited_candidates:
+                ties = unvisited_candidates
+
+        if len(ties) > 1:
+            tie_break = "seeded_random"
+            chosen = self.rng.choice(ties)
+        else:
+            chosen = ties[0]
+
+        return chosen, {
+            "candidate_moves": candidates,
+            "vote_counts": counts,
+            "initial_ties": [
+                direction for direction, count in counts.items()
+                if count == highest
+            ],
+            "confidence_scores": confidence_scores,
+            "unvisited_tie_candidates": unvisited_candidates,
+            "final_tie_candidates": ties,
+            "tie_break": tie_break,
+        }
 
     def _update_memory_after_turn(self, sightlines: Dict[str, Sightline]) -> None:
         for sightline in sightlines.values():
@@ -553,6 +765,10 @@ Verified team map from earlier turns:
         dx, dy = DIRECTIONS[direction]
         self.group_pos = (self.group_pos[0] + dx, self.group_pos[1] + dy)
         self.visited_tiles.add(self.group_pos)
+        self.visit_counts[self.group_pos] = self.visit_counts.get(self.group_pos, 0) + 1
+        self.position_history.append(self.group_pos)
+        if self._detect_cycle():
+            self.oscillation_turns += 1
         self.treasure_value *= DECAY_RATE
         self.turn_count += 1
         self._update_memory_after_turn(sightlines)
@@ -648,12 +864,14 @@ Allocate exactly 100% of the reward."""
                     self._record_detected_leads(sightlines, "UNVERIFIED_PEER_REPORT")
 
                 votes = {agent: final[agent]["vote"] for agent in AGENT_IDS}
-                chosen = self._choose_group_direction(votes)
+                chosen, selection_metadata = self._choose_group_direction(final)
 
                 turn = {
                     "turn": self.turn_count + 1,
                     "group_position_before": list(self.group_pos),
                     "correct_moves": self._correct_moves(),
+                    "legal_moves": self._valid_moves(),
+                    "movement_candidates": selection_metadata["candidate_moves"],
                     "sightlines": {agent: sightline.record() for agent, sightline in sightlines.items()},
                     "initial_decisions": initial,
                     "initial_call_metadata": initial_meta,
@@ -661,8 +879,13 @@ Allocate exactly 100% of the reward."""
                     "final_decisions": final,
                     "final_call_metadata": final_meta,
                     "votes": votes,
+                    "vote_counts": selection_metadata["vote_counts"],
+                    "selection_metadata": selection_metadata,
                     "chosen_direction": chosen,
                     "team_memory_before": {str(key): value for key, value in self.team_memory.items()},
+                    "recent_positions_before": [list(pos) for pos in self.position_history[-6:]],
+                    "cycle_period_before": self._detect_cycle(),
+                    "oscillating_before": self._detect_cycle() > 0,
                 }
 
                 self.turn_history.append(turn)
@@ -699,6 +922,11 @@ Allocate exactly 100% of the reward."""
             "total_turns": self.turn_count,
             "final_treasure_value": round(self.treasure_value, 4) if self.found_treasure else 0.0,
             "efficiency_j": round(efficiency, 6),
+            "unique_tiles_visited": len(self.visited_tiles),
+            "total_tile_visits": sum(self.visit_counts.values()),
+            "max_tile_visit_count": max(self.visit_counts.values()) if self.visit_counts else 0,
+            "oscillation_turns": self.oscillation_turns,
+            "final_position_history": [list(pos) for pos in self.position_history],
             "turn_history": self.turn_history,
             "allocation": allocation,
             "usage": usage,
